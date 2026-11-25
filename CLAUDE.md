@@ -5,7 +5,7 @@ Generations Ultimate quests running on **MHGURecomp 0.18.0** (native PC port, gi
 treats it as a real player: it shows in the HUD's party list, counts towards monster HP (the port's `[Monster HP]`
 option), moves, attacks and uses up carts.
 
-- **Current version:** 0.1.10 (see "Current state" and "History").
+- **Current version:** 0.1.12, the base version (see "Current state"; past versions: [HISTORY.md](HISTORY.md)).
 - **Language:** C, built for 32-bit ARM (the Switch), packaged as a `.nro` (Forge plugin).
 - **Installed at:** `mods\NPC-Hunter\romfs\nativeNX\plugins\npc_hunter.nro` in the MHGURecomp folder.
 - **Source:** the `src\` folder next to this file.
@@ -24,7 +24,7 @@ option), moves, attacks and uses up carts.
 On-screen messages (Forge's ImGui overlay, no accents: the font may lack them): F4, F7, F6, "O Ajudante entrou na
 missao (NPC Hunter x.y.z)" (the helper joined the quest) and "O Ajudante caiu" (the helper fell).
 
-## Current state (0.1.10)
+## Current state (0.1.12)
 
 Works:
 - The helper joins the quest while it loads, at the same step where the game makes the other players' hunters. It takes
@@ -32,20 +32,31 @@ Works:
 - It shows in the HUD party list; the port counts 2 hunters (`[hpscale] ... 2 hunter(s)`).
 - It moves, follows you, runs to the zone's large monster, attacks (X, X, A), rolls when hit and sheathes to run. In
   another zone than yours for more than 3 s, it appears next to you.
-- Its cart counts for the quest: the game's own death routine takes it (credited to your slot).
-
-To confirm (0.1.10 change, not tested yet):
-- Monsters now paying attention to it (its scores used to be always 0; see "Monster attention").
+- Monsters pay attention to it (hook on `0x26946c`).
+- Its faint counts as its own ("Ajudante fainted", quest faint slots `0 1 0 0`).
+- **Its cart:** it is carried to the camp and wakes up in the tent with full HP; you stay where you are and your camera
+  is not touched. Why this needed work: during its move the helper is local, so its fall ran this machine's local-only
+  parts:
+  - the fall's camera: `0x4a0698` starts the camera manager's view from above on it (`0x219240`); the fall marks `+6`
+    and gives the camera back at its end (`0x219384`, event 8);
+  - the cart: at the end of the fall (600-frame timer `+0x27a0`, then `0x4c3430`) `0x5ae550(sQuest)` sets the stage
+    flags `|= 0xe` and the scene reloads **this machine's** hunter at the camp.
+  Inside the helper's move, `0x4a0698` answers 0 (as for a remote hunter), event-8 calls on it are dropped and
+  `0x5ae550` leaves the stage alone. The helper comes back the way a remote hunter does after its own game carted it:
+  the "came back" message `0x4011b8` with mode 3 (`+0x1470 = 3`, respawn vtable +0x370 → waking-up action `0x200`).
+  If it ever wakes at 0 HP, the plugin gives it back (logged).
+- **1 s cart** (the owner's choice; the game itself waits ~10 s): the cart starts at the faint (`faint_hook`), with the
+  same test as `0x5ae550` (no cart when faints are used up, no reward is left or the quest is won); camp 60 frames later.
+- **When you cart, the helper keeps fighting:** no teleport to you while you are fallen (act 0x100), waking (0x200) or
+  still in the camp after your cart (`g_me_carted`, cleared when you leave zone 0). With no monster there it waits.
 
 To do:
-1. **Full cart:** after falling, the helper is not carried to camp. It stays at 0 HP for a few seconds, then comes back
-   with very little HP, where it fell. Still to find: the part of the game that takes **your** hunter to camp (fade,
-   Felyne cart `uQuestNpcCatCart`, waking up in the tent) and doing it for the helper. 0.1.10 logs everything
-   (`[npc-cart]`) to copy that sequence: it needs a test where you cart yourself.
+1. Cart: the Felyne cart animation is not shown.
 2. Palicos: 2 come along (yours). With 2 hunters the total matches the normal game, but both are yours.
 3. AI: large monsters only, no items, no dodging before a hit, no changing zones on its own (only the teleport).
 
-Design rule: no made-up shortcuts (e.g. "gets up after 5 s"): behaviour must be the game's own.
+Design rule: no made-up shortcuts (e.g. "gets up after 5 s"): behaviour must be the game's own, unless the owner asks
+for a change (as for the 1 s cart).
 
 ## How it works (architecture)
 
@@ -86,9 +97,11 @@ bash build.sh          # npc.c + crt0.s -> npc.elf -> npc_hunter.nro (elf2nro.py
   (`R_ARM_RELATIVE`, `JUMP_SLOT`, `GLOB_DAT`, `ABS32`): what the port's loader accepts.
 - No libc: no `memcpy` / `atan2f` / libgcc divisions (the code has an approximate `atan2f_`).
 - Export only: `init`, `fini`, `forge_onLoad`, `forge_onUpdate`, `forge_onImGuiFreeRender`.
-- When changing the version, update `NPC_VERSION` in `npc.c` (shown in the log and in the join message).
+- **Versions and builds:** `NPC_VERSION` in `npc.c` changes only when the owner decides a new version is due. Every build
+  gets a random 8-hex-digit build id (`build.sh` makes it; `NPC_BUILD=xxxxxxxx sh build.sh` to choose one), shown as
+  `NPC Hunter 0.1.12 (build xxxxxxxx)` in the log and in the join message. Refer to builds by that id.
 - **Installing from Claude:** the copy into the game folder can pick up an older version of the file. Always give the output file
-  a new name (e.g. `npc_hunter_0.1.11.nro`) and check the SHA-1 of the installed file.
+  a new name (e.g. `npc_hunter_<build>.nro`) and check the SHA-1 of the installed file.
 
 ## Testing and reading the log
 
@@ -113,13 +126,16 @@ Always check the first line: `[npc] NPC Hunter 0.1.x loaded`.
 | Address | Object | Notes |
 |---|---|---|
 | 0x1a85b58 | `sPlayer*` | +0x1c: the 4 hunters by slot; +0x7c: your data; +0x5dc + slot*0x560: member data (quest); +0x1b5c + slot*0x560: member data (hub) |
-| 0x1a8ca48 | `sGameControl*` | +0x30: your slot (`0x5f8398`) |
+| 0x1a8ca48 | `sGameControl*` | +0x30: your slot (`0x5f8398`); +0x49 current zone, +0x4a zone to load (a cart sets 0), +0x4b previous zone |
 | 0x1a51fe0 | `sEnemy*` | +0x1c: the zone's 10 enemies; +0x25ac: mask of hunters to ignore |
 | 0x1a843f0 | `sFestaNetwork*` | +0x63e: in a session (`0x427ba8`); +0xa90: each member's state (3 = in the quest) |
 | 0x1a8ae38 | `sQuestSelector*` | +0xd68: ordered quest; +0xd750 `mJoinNum`; +0xd754: members (12 bytes each) — stays 0 offline |
-| 0x1a8ad90 | `sQuest*` | +0x4c state; +0xc0 cart allowance (quest fails at 0); +0xc4 cost of a cart; +0x166a the quest's carts; +0x166b + slot carts per player |
+| 0x1a8ad90 | `sQuest*` | +0x4c state; +0x55 u8 quest state (≥ 9: won; `0x5ae550` sets 0xc); +0xc0 cart allowance (quest fails at 0); +0xc4 cost of a cart; +0x1669 u8 faints allowed; +0x166a u8 the quest's faints; +0x166b + slot faints per player; +0x1777 u8 (≠ 0: `0x5ae550` carts anyway) |
+| 0x1a977a0 | stage* | +0x1a4 flags: 2 reload the area, 4 at the camp's start point (`0x700420`), 8 at the cart's start point (`0x70049c`); a cart sets 0xe. +0x388: start points (13 max) |
+| 0x1a4d750 | camera manager (events)* | +0x54 the active camera; `0x219240` starts a view on a hunter, `0x219384` / `0x219404` events |
+| 0x1a570d0 | scene / event checker* | `0x34c8b8` scripted events |
 | 0x1a8c670 | `sFestaPad*` | the pad's gameplay view at +0x6b98 (see "Pad") |
-| 0x2326504 | camera manager* | +0x54: the camera in use (eye +0x40, target +0x60) |
+| 0x2326504 | camera manager (view)* | +0x54: the camera in use (eye +0x40, target +0x60) |
 
 ### Game functions
 
@@ -144,8 +160,24 @@ Always check the first line: `[npc] NPC Hunter 0.1.x loaded`.
 | 0x4ab670 | (player, act_st, act_no, param) | "do" an action (vtable +0x2f8) |
 | 0x4831e0 | (player, act_st, act_no, param) | "set" an action (e.g. back to idle) |
 | 0x4c3220 | (player) | death routine; if local: `0x5a9754(sQuest, 0, slot)` takes a cart |
-| 0x5a9754 → 0x5a9934 | (sQuest, …) | counts a cart (offline credits your slot) |
+| 0x5a9754 → 0x5a9934 | (sQuest, …) | counts a cart (offline credits your slot). **Hook:** credited to the helper's slot |
+| 0x5ae550 | (sQuest) | end of a local hunter's fall: unless the quest is lost / won, stage `+0x1a4 |= 0xe` = cart this machine's hunter. **Hook** |
+| 0x4011b8 | (?, packet, slot) | a remote hunter came back: packet +0x10 pos, +0x20 yaw, +0x22 zone, +0x23 mode (3 = cart); vtable +0x374(mode), +0x370 respawn |
+| 0x70049c | (stage, index, 0, vec4 *pos, u32 *yaw) | the start point a cart uses |
+| 0x4ad6fc | (player, pos, yaw, zone, 0) | respawn (vtable +0x370): switch on `+0x1470` (3 → action 0x200, wake up at camp); ends with `+0x1470 = 0` |
 | 0x5a9bb8 | (sQuest, kind, value) | the same, from the network (`netPLDeathCntUp`) |
+| 0x4c3220 phases | | the fall action: routine bytes at player +4..+7 (+5 phase: 0 start, 1 lying, 2 timer done; +6 = 1 when the fall's camera started). Phase 0 (local): faint count, `0x4a0698` camera, timer `+0x27a0 = 600.0`; phase 1: timer (`0x73aa84`), then phase 2, camera event 8 if +6, `0x5ae550` |
+| 0x4a0698 | (player, kind) → bool | local only: starts the fall's camera (`0x219240` on the events camera manager), returns 1. **Hook:** 0 for the helper |
+| 0x219240 | (camMgr, player, …, player, float) | starts a camera view on a hunter (the fall's view from above) |
+| 0x219384 | (camMgr, player, kind, 0) | camera event on a hunter (8 at the end of a fall; also `0x4c383c`). **Hook:** dropped for the helper inside its move |
+| 0x89fb68 | (scene) | the quest scene's state machine (+4 routine bytes, +0xb8 mode: 3 → `0x89f4d8`) |
+| 0x89f4d8 | (scene) | a scene mode that sets zone 0 (`gc +0x4a`) and stage flags `|= 6` |
+| 0x8a0bcc | () | reloads the area: start point from the stage flags (`0x70049c` / `0x700420`), then `0x4778cc` |
+| 0x4778cc | (sPlayer, pos, yaw, zone) | respawns **your** hunter there (vtable +0x370), sends it (`0x401128`), vtable +0x134 on all 4 hunters |
+| 0x401128 | (net, pos, yaw, zone, mode) | sends "came back" (the packet `0x4011b8` reads) |
+| 0x476748 | (sPlayer, slot) → player | the slot's hunter (used by the network handlers) |
+| 0x700420 | (stage, index, 0, vec4 *pos, u32 *yaw) | the camp's start point |
+| 0x4a4324 | (player, kind) | status setup: max HP `+0x13d8` (vtable +0x15c(0xc)), HP = max |
 | 0x2bbf98 | (monster) | updates the attention scores; skips slots with a bit in `sEnemy +0x25ac` (`0x26946c`) or not ready |
 | 0x2692ac | (sEnemy) | fills the ignore mask: offline = everyone but you |
 | 0x8c02a4 | (area) | depart on a quest from town |
@@ -165,15 +197,17 @@ Always check the first line: `[npc] NPC Hunter 0.1.x loaded`.
 | +0x13c8 | u32 | mode (0 quest, 1 hub, …) |
 | +0x13cc | u32 | bit 0: local |
 | +0x13d0 | u32 | loading state (3 = ready) |
-| +0x13d6 / +0x13da | s16 | HP / red HP |
+| +0x13d6 / +0x13d8 / +0x13da | s16 | HP / max HP / red HP |
 | +0x13f4 … +0x1463 | | input block (0x70): +0x13f4 held, +0x13f8 new, +0x13fc word, +0x140c stick angle, +0x1410 tilt |
-| +0x1470 | u32 | ≠0: update on hold (the opening's wait) |
+| +0x1470 | u32 | entry mode, ≠0: update on hold (1 the opening's wait, 3 back from a cart; the respawn sets 0). The move hook undoes only a 1 |
 | +0x1480 | vec3 | a remote hunter's position target (20-frame glide) |
-| +0x2506 / +0x250a | u16 | current action: act_st / act_no (0x0001 common, 0x0010 weapon, 0x0100 fallen) |
+| +0x2506 / +0x250a | u16 | current action: act_st / act_no (0x0001 common, 0x0004 falling down a ledge, 0x0010 weapon, 0x0040 hit, 0x0100 fallen, 0x0200 waking up at the camp after a cart) |
+| +0x27a0 | float | the fall's timer (600.0 frames) |
 | +0x28b8 | s32 | >0: stick reversed (confusion) |
 
 Vtable: +0x24 update, +0x88 ready, +0x9c / +0xa0 / +0xa4 (place in another zone, as `0x4762e4` does), +0x228 read
-pad, +0x254, +0x2f8 do action, +0x374 set `+0x1470`.
+pad, +0x254, +0x2f8 do action (0x4ab670), +0x370 respawn (0x4ad6fc), +0x374 set `+0x1470` (0x4ae510).
+Player vtables in `main`: image offset 0x1746ff0 and others (each weapon class; found by +0x370 = 0x4ad6fc).
 
 ### Pad (`sFestaPad +0x6b98`, gameplay view)
 

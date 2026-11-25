@@ -8,25 +8,24 @@ Palicoes. This project tries to give MHGU a helper hunter that hunts with you as
 
 It is a **Forge plugin** (`.nro`), written in C, that hooks the game's own code. No game files are included or changed.
 
-## What it does today (version 0.1.10)
+## What it does today (version 0.1.12)
 
-- **Joins your quest:** a second hunter (the "Ajudante", Portuguese for "helper") joins your solo quests. It is a copy
-  of your own hunter: same weapon, armour and looks.
+- **Joins your quest:** a second hunter, joins your solo quests. For now it is a copy of your own
+  hunter: same weapon, armour and looks.
 - **Counts as a party member:** it shows in the party list on the HUD, and MHGURecomp's monster HP scaling counts it as
   a second hunter.
 - **Hunts with you:** it follows you, runs to the large monster in its area, attacks, rolls when hit, sheathes its
-  weapon to run, and appears next to you if it gets left behind in another area.
-- **Its carts count:** when it faints, the quest's cart counter goes up, as for a real player.
+  weapon to run, and appears next to you if it gets left behind in another area. Monsters target it too.
+- **Carts like a player:** when it faints, the quest's cart counter goes up and it is carried back to camp, while you
+  keep hunting. When you faint, it keeps fighting the monster.
 
 Everything it does goes through the game's own code: its moves are real moves, made by pressing buttons on a "virtual
 controller" the game reads for it.
 
 ## Known problems
 
-- Monsters may ignore it (a fix is in 0.1.10, not tested yet).
-- When it faints, it is not carried back to camp: it stays where it fell.
-- Both Palicoes stay yours.
-- The AI is basic: large monsters only, no items, no dodging before a hit.
+- No mapping / waypoints, so the helper teleports to you when it needs to change area.
+- The AI is very basic; still testing and finding more bugs.
 
 ## Goal
 
@@ -62,7 +61,8 @@ bash build.sh
 
 ## More
 
-- [CLAUDE.md](CLAUDE.md): how it works, every game address used, and the history of each version.
+- [CLAUDE.md](CLAUDE.md): how it works and every game address used.
+- [HISTORY.md](HISTORY.md): what each version changed.
 - [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md): credits for code taken from forge-rs.
 
 This is a fan project, not affiliated with Capcom or Nintendo. Built with the help of Claude (Anthropic).

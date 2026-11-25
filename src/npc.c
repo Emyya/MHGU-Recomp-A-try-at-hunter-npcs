@@ -12,7 +12,11 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define NPC_VERSION "0.1.10"
+#define NPC_VERSION "0.1.12"
+#ifndef NPC_BUILD
+#define NPC_BUILD "dev"
+#endif
+#define NPC_NAME "NPC Hunter " NPC_VERSION " (build " NPC_BUILD ")"
 
 typedef uint32_t u32;
 typedef uint16_t u16;
@@ -85,6 +89,8 @@ void fini(void) {}
 #define G_CAMERAS    0x2326504u  // the camera manager *: +0x54 the camera in use (eye +0x40, target +0x60)
 #define G_SENEMY     0x1a51fe0u  // sEnemy *: +0x1c the 10 live enemies of the zone
 #define EN_INFO      0x1428u     // enemy: status block (+0x40 position, +0x1b6 u16 network id, +0x370 s32 HP)
+#define PL_ACT_ST    0x2506u     // u16 act_st (0x0001 common, 0x0004 fall, 0x0010 weapon, 0x0100 fallen)
+#define PL_ACT_NO    0x250au
 #define B_A 0x100u
 #define B_B 0x80u
 #define B_X 0x20u
@@ -113,6 +119,7 @@ typedef void (*fn_setok)(u32, u32);
 typedef u32 (*fn_make)(u32, u32, u32);
 typedef u32 (*fn_vt0)(u32);
 typedef void (*fn_vt1)(u32, u32);
+typedef void (*fn_do_action)(u32, u32, u32, u32);  // (player, act_st, act_no, param)
 
 static u32 g_npc;       // the hunter we made (0: none)
 static int g_npc_slot = -1;
@@ -186,7 +193,7 @@ static u32 make_me_hook(u32 sp, u32 mode) {
     forge_log(LOG_INFO, "[npc] quest loading: our hunter %08x (slot %u) made, helper into slot %d", mine, me, slot);
     if (slot < 0 || !sane(mine)) return r;
     u32 npc = make_helper(sp, me, slot);
-    if (sane(npc)) g_npc = npc, g_npc_slot = slot, g_npc_owner = mine, g_placed = false, toast("O Ajudante entrou na missao (NPC Hunter " NPC_VERSION ")", true);
+    if (sane(npc)) g_npc = npc, g_npc_slot = slot, g_npc_owner = mine, g_placed = false, toast("O Ajudante entrou na missao (" NPC_NAME ")", true);
     return r;
 }
 
@@ -363,16 +370,21 @@ static void pl_input_hook(u32 pl) {
 #define FN_PL_MOVE   0x49b65cu
 static fn_pl_pad g_pl_move_orig;
 static u32 g_move_calls, g_wait_fixes;
+static bool g_me_carted;      // we were carted and have not left the camp yet: the helper stays where it fights
+static u32 g_back_at;       // frame the helper came back at the camp (0: not)
+static bool g_in_npc_move;  // inside the helper's update (its local window)
 #define PL_WAIT      0x1470u     // u32: not 0, the hunter's update is skipped (0x49b8e8)
 static void pl_move_hook(u32 pl) {
     if (!(g_npc && pl == g_npc && g_drive)) { g_pl_move_orig(pl); return; }
     u32 f = R32(pl + PL_LOCAL), wait = R32(pl + PL_WAIT);
     R32(pl + PL_LOCAL) = f | 1u;
+    g_in_npc_move = true;
     g_pl_move_orig(pl);
+    g_in_npc_move = false;
     R32(pl + PL_LOCAL) = (R32(pl + PL_LOCAL) & ~1u) | (f & 1u);
     // Our own hunter's first update puts it on hold for the quest's opening (0x49b7d4: vtable +0x374 with 1, +0x1470),
     // which the quest start lifts for ours only: the helper's stays as the others' are.
-    if (R32(pl + PL_WAIT) != wait) {
+    if (R32(pl + PL_WAIT) != wait && R32(pl + PL_WAIT) == 1u) {
         if (g_wait_fixes++ < 5) forge_log(LOG_INFO, "[npc] helper put on hold (%08x): undone", R32(pl + PL_WAIT));
         R32(pl + PL_WAIT) = wait;
     }
@@ -410,6 +422,28 @@ static u32 target_monster(u32 npc) {
     return best;
 }
 
+// A fall (act_st 0x0004, e.g. the drop from area 5 to 8 of the Jurassic Frontier) ends on landing, which the helper
+// never does (stays in the air, not moving). After 1.5 s like that: the game's own "set action" back to standing
+// (0x4831e0 with 1:0, as the hunter's own code does), in its local window; logged.
+#define FN_SET_ACTION 0x4831e0u
+static u32 g_fall_frames;
+static float g_fall_x, g_fall_y, g_fall_z;
+static void unstick_fall(u32 npc) {
+    if (R16(npc + PL_ACT_ST) != 0x0004) { g_fall_frames = 0; return; }
+    float x = RF(npc + PL_POS), y = RF(npc + PL_POS + 4), z = RF(npc + PL_POS + 8);
+    float d = fabsf_(x - g_fall_x) + fabsf_(y - g_fall_y) + fabsf_(z - g_fall_z);
+    g_fall_x = x, g_fall_y = y, g_fall_z = z;
+    if (d > 1.0f) { g_fall_frames = 0; return; }
+    if (++g_fall_frames < 90) return;
+    g_fall_frames = 0;
+    forge_log(LOG_INFO, "[npc] helper stuck in a fall (act 0004:%04x) at %d %d %d zone %u: set back to standing", R16(npc + PL_ACT_NO),
+              (int)x, (int)y, (int)z, R8(npc + PL_AREA));
+    u32 f = R32(npc + PL_LOCAL);
+    R32(npc + PL_LOCAL) = f | 1u;
+    ((fn_do_action)A(FN_SET_ACTION))(npc, 1, 0, 0);
+    R32(npc + PL_LOCAL) = f;
+}
+
 static void think(u32 npc, u32 mine) {
     v_cur = 0, v_mag = 0;
     g_t++;
@@ -420,7 +454,10 @@ static void think(u32 npc, u32 mine) {
     bool drawn = R8(npc + PL_DRAWN) != 0;
 
     // Another zone than ours for 3 s: beside us again (as the followers of other games do).
-    if (R8(npc + PL_AREA) != R8(mine + PL_AREA)) {
+    u16 my_act = R16(mine + PL_ACT_ST);
+    if (g_me_carted && R8(mine + PL_AREA) != 0 && my_act != 0x0200) g_me_carted = false;  // we left the camp
+    bool we_are_down = my_act == 0x0100 || my_act == 0x0200 || g_me_carted;
+    if (R8(npc + PL_AREA) != R8(mine + PL_AREA) && !we_are_down && !(g_back_at && g_frames - g_back_at < 1200)) {
         if (++g_away_since > 180) { place(npc, mine); g_away_since = 0; set_state(S_WARP); }
     } else g_away_since = 0;
 
@@ -455,7 +492,8 @@ static void think(u32 npc, u32 mine) {
         if (ph == 5) g_combo++;
         return;
     }
-    // No monster near: come along with us; the weapon away for running.
+    // No monster near: come along with us; the weapon away for running (not while we are down or in another zone).
+    if (we_are_down || R8(npc + PL_AREA) != R8(mine + PL_AREA)) { set_state(S_IDLE); return; }
     if (dp > 600.0f * 600.0f) {
         if (drawn) {
             set_state(S_SHEATHE);
@@ -470,6 +508,160 @@ static void think(u32 npc, u32 mine) {
     set_state(S_IDLE);
 }
 
+
+// ------------------------------------------------------------------ the quest's end
+// After the quest is cleared the game counts down (60 s) to the return; with the helper it did not. Logged: the words of
+// sQuest +0x40..+0xff that change (each second at most), with the helper's action, to see what it waits for.
+static u32 g_qw[48], g_qw_at;
+static bool g_qw_init;
+static void quest_watch(void) {
+    if (g_frames - g_qw_at < 60) return;
+    g_qw_at = g_frames;
+    u32 q = R32(A(0x1a8ad90u));
+    if (!sane(q)) return;
+    for (u32 i = 0; i < 48; i++) {
+        u32 v = R32(q + 0x40 + 4 * i);
+        if (g_qw_init && v != g_qw[i] && i != 32 && i != 33)  // (+0xc0 / +0xc4: the carts, logged elsewhere)
+            forge_log(LOG_INFO, "[npc-quest] sQuest +%03x: %08x -> %08x (helper act %04x:%04x)", 0x40 + 4 * i, g_qw[i], v,
+                      g_npc ? R16(g_npc + 0x2506) : 0, g_npc ? R16(g_npc + 0x250a) : 0);
+        g_qw[i] = v;
+    }
+    g_qw_init = true;
+}
+
+
+// ------------------------------------------------------------------ the helper's cart
+// A local hunter's death counts a faint: 0x5a9754(sQuest, 0, its slot). Offline that ignores the slot and counts it for
+// the quest's own member (sQuestSelector +0xd56 -> member entry +0xd758: our slot), and a faint of OUR slot is what sends
+// this game's hunter to camp (0x5a9934: message 3, the area reloads at the camp, 0x8a0bcc -> 0x4778cc -> vtable +0x370).
+// So for the helper's death the member entry says its slot for that one call: the game counts the faint as the helper's
+// ("<name> fainted", message 4) and we stay where we are.
+// Then what the helper's own game would do: after its fall, it comes back at the camp's first start point (0x700420,
+// as 0x8a0bcc finds it) through the same respawn method (vtable +0x370, 0x4ad6fc) the game uses for ours.
+#define FN_FAINT      0x5a9754u
+#define FN_START_POS  0x700420u  // (stage, index, 0, vec4 *out, u32 *yaw out)
+#define G_STAGE       0x1a977a0u // * the quest's stage (+0x388: start points)
+#define SEL_MY_MEMBER 0xd56u
+#define SEL_MEM_SLOT  0xd758u
+#define FN_CART       0x5ae550u  // (sQuest): the fall's end (0x4c3430, a local hunter, after its timer): to camp
+#define FN_CART_POS   0x70049cu  // (stage, index, 0, vec4 *out, u32 *yaw out): the start point a cart uses (0x8a0c98)
+#define FN_NET_BACK   0x4011b8u  // (?, packet, slot): a remote hunter says where it came back (0x401128 sends it)
+#define CART_DELAY    60         // frames from the helper's fall to the camp (asked: at most 1 s; the game waits ~10 s)
+#define PL_MAX_HP     0x13d8u
+#define PL_RED_HP     0x13dau
+typedef void (*fn_faint)(u32, u32, u32);
+typedef void (*fn_start_pos)(u32, u32, u32, u32, u32);
+typedef void (*fn_cart)(u32);
+typedef void (*fn_net_back)(u32, u32, u32);
+static fn_faint g_faint_orig;
+static fn_cart g_cart_orig;
+static u32 g_cart_at;         // frame the helper's cart began (0: none pending)
+static u32 g_wake_check;      // frame to check the helper's health after waking (0: none)
+static u32 g_my_cart_at;      // frame our own cart began (for the timing)
+
+static void faint_hook(u32 q, u32 kind, u32 slot) {
+    u32 net = R32(A(G_NETWORK)), sel = R32(A(G_SELECTOR));
+    bool offline = sane(net) && R8(net + NET_ONLINE) == 0;
+    if (!(g_in_npc_move && kind == 0 && offline && sane(sel) && g_npc_slot >= 0)) { g_faint_orig(q, kind, slot); return; }
+    int idx = (int8_t)R8(sel + SEL_MY_MEMBER);
+    u32 e = sel + SEL_MEM_SLOT + 12u * (u32)(idx < 0 ? 0 : idx);
+    u8 was = R8(e);
+    R8(e) = (u8)g_npc_slot;
+    g_faint_orig(q, kind, slot);
+    R8(e) = was;
+    forge_log(LOG_INFO, "[npc-cart] frame %u: the helper's faint counted as its own (slot %d)", g_frames, g_npc_slot);
+    // The same test as the fall's end (0x5ae550): no cart when the faints are used up, no reward is left or the quest is won.
+    bool lost = R8(q + 0x166a) >= R8(q + 0x1669) || (int32_t)R32(q + 0xc0) < 1;
+    if (R8(q + 0x1777) != 0 || !(lost || R8(q + 0x55) >= 9)) g_cart_at = g_frames;
+}
+
+// 0x5ae550 is where a fallen LOCAL hunter's cart begins: unless the quest is lost (faints used up, no reward left) or
+// already won (+0x55 >= 9), it sets the stage's flags |= 0xe, and the scene then reloads the area at the camp for this
+// game's hunter (0x89f4d8 -> 0x8a0bcc -> 0x4778cc). The helper's fall runs it too (it is local during its own move): that
+// is what took us to the camp with it. So for the helper the stage is left alone, and the helper comes back the way a
+// remote hunter does when its own game has carted it: the "came back" message (0x4011b8) with mode 3 (cart), which
+// sets +0x1470 = 3 and respawns it (vtable +0x370: mode 3 -> the waking-up action 0x200, 0x4ada34).
+static void cart_hook(u32 q) {
+    if (!g_in_npc_move) {
+        g_my_cart_at = g_frames;
+        g_me_carted = true;
+        forge_log(LOG_INFO, "[npc-cart] frame %u: our cart begins (stage flags %08x)", g_frames,
+                  sane(R32(A(G_STAGE))) ? R32(R32(A(G_STAGE)) + 0x1a4) : 0);
+        g_cart_orig(q);
+        return;
+    }
+    bool lost = R8(q + 0x166a) >= R8(q + 0x1669) || (int32_t)R32(q + 0xc0) < 1;
+    if (R8(q + 0x1777) == 0 && (lost || R8(q + 0x55) >= 9)) {
+        forge_log(LOG_INFO, "[npc-cart] frame %u: the helper's fall ends, no cart (faints %u/%u, reward %d, quest state %u)", g_frames,
+                  R8(q + 0x166a), R8(q + 0x1669), (int32_t)R32(q + 0xc0), R8(q + 0x55));
+        g_cart_orig(q);  // (nothing, or the won quest's own state)
+        return;
+    }
+    forge_log(LOG_INFO, "[npc-cart] frame %u: the helper's fall ends (its cart was started at the faint; the stage is left alone)", g_frames);
+}
+
+// A local hunter's fall also points THIS machine's camera at it: 0x219384(camera manager [0x1a4d750], hunter, 8, 0),
+// called from the fall (0x4c383c, 0x4c349c) only when the hunter is local. The helper is local during its move, so its
+// fall took our camera (the view from above on it, back to us some seconds later). Calls aimed at the helper from
+// inside its move are dropped: a remote hunter's fall does not move our camera.
+#define FN_CAM_EVENT  0x219384u
+typedef void (*fn_cam_event)(u32, u32, u32, u32);
+static fn_cam_event g_cam_orig;
+static u32 g_cam_drops;
+static void cam_hook(u32 mgr, u32 pl, u32 kind, u32 arg) {
+    if (g_in_npc_move && g_npc && pl == g_npc) {
+        if (g_cam_drops++ < 20) forge_log(LOG_INFO, "[npc-cart] frame %u: camera event %u on the helper dropped", g_frames, kind);
+        return;
+    }
+    g_cam_orig(mgr, pl, kind, arg);
+}
+
+// The fall's own camera: at the start of a fall (0x4c33ac) a LOCAL hunter calls 0x4a0698(hunter, kind), which starts the
+// camera manager's fall view on it (0x219240: the view from above) and returns 1; the fall then marks +6 and, at its end,
+// gives the camera back (event 8 above). For a hunter that is not local it returns 0 and does nothing. For the helper
+// (local only during its move) it now answers as for a remote hunter: 0, no camera, nothing to give back.
+#define FN_FALL_CAM   0x4a0698u
+typedef u32 (*fn_fall_cam)(u32, u32);
+static fn_fall_cam g_fall_cam_orig;
+static u32 fall_cam_hook(u32 pl, u32 kind) {
+    if (g_in_npc_move && g_npc && pl == g_npc) {
+        forge_log(LOG_INFO, "[npc-cart] frame %u: the fall's camera on the helper not started (kind %u)", g_frames, kind);
+        return 0;
+    }
+    return g_fall_cam_orig(pl, kind);
+}
+
+static void cart_check(u32 npc, u32 mine) {
+    (void)mine;
+    if (g_wake_check && g_frames >= g_wake_check) {
+        g_wake_check = 0;
+        forge_log(LOG_INFO, "[npc-cart] frame %u: helper after waking: hp %d/%d act %04x:%04x zone %u 1470 %u", g_frames,
+                  (int)(s16)R16(npc + PL_HP), (int)(s16)R16(npc + PL_MAX_HP), R16(npc + PL_ACT_ST), R16(npc + PL_ACT_NO),
+                  R8(npc + PL_AREA), R32(npc + PL_WAIT));
+        if ((s16)R16(npc + PL_HP) <= 0 && (s16)R16(npc + PL_MAX_HP) > 0) {  // a cart gives the health back
+            R16(npc + PL_HP) = R16(npc + PL_MAX_HP);
+            R16(npc + PL_RED_HP) = R16(npc + PL_MAX_HP);
+            forge_log(LOG_WARN, "[npc-cart] the helper woke with no health: given back (%d)", (int)(s16)R16(npc + PL_HP));
+        }
+    }
+    if (!g_cart_at || g_frames - g_cart_at < CART_DELAY) return;
+    g_cart_at = 0;
+    u32 stage = R32(A(G_STAGE));
+    if (!sane(stage)) { forge_log(LOG_WARN, "[npc-cart] no stage: the helper stays down"); return; }
+    volatile u32 pkt[12];  // as 0x401128 builds it: +0x10 position (x y z 0), +0x20 u16 yaw, +0x22 zone, +0x23 mode
+    for (int i = 0; i < 12; i++) pkt[i] = 0;
+    volatile u32 yaw = 0;
+    ((fn_start_pos)A(FN_CART_POS))(stage, 0, 0, (u32)(uintptr_t)&pkt[4], (u32)(uintptr_t)&yaw);
+    pkt[7] = 0;
+    pkt[8] = (yaw & 0xffffu) | (0u << 16) | (3u << 24);  // zone 0 (the camp, as the scene sets it: 0x89f62c), mode 3
+    ((fn_net_back)A(FN_NET_BACK))(0, (u32)(uintptr_t)pkt, (u32)g_npc_slot);
+    g_back_at = g_frames;
+    g_wake_check = g_frames + 240;
+    forge_log(LOG_INFO, "[npc-cart] frame %u: helper back at the camp (%d %d %d, yaw %04x): hp %d act %04x:%04x zone %u 1470 %u",
+              g_frames, (int)*(volatile float *)&pkt[4], (int)*(volatile float *)&pkt[5], (int)*(volatile float *)&pkt[6], yaw & 0xffffu,
+              (int)(s16)R16(npc + PL_HP), R16(npc + PL_ACT_ST), R16(npc + PL_ACT_NO), R8(npc + PL_AREA), R32(npc + PL_WAIT));
+    toast("O Ajudante foi levado para o acampamento", false);
+}
 
 // ------------------------------------------------------------------ metrics: who the monsters go for
 // A large monster's status block keeps an attention score per hunter (+0x254, 4 x s32, by slot) and per Palico (+0x264,
@@ -564,6 +756,16 @@ static void let_monsters_see(u32 npc_slot) {
     }
 }
 
+// The mask is set again every frame before the attention runs (0.1.10 cleared it after: too late), so the check itself
+// (0x26946c: sEnemy, slot -> 1 ignored) answers "not ignored" for the helper's slot.
+#define FN_EN_IGNORED 0x26946cu
+typedef u32 (*fn_ignored)(u32, u32);
+static fn_ignored g_ignored_orig;
+static u32 ignored_hook(u32 sen, u32 slot) {
+    if (g_npc && (int)slot == g_npc_slot) return 0;
+    return g_ignored_orig(sen, slot);
+}
+
 static u32 g_trace_until;  // frames: every action and HP change of the helper logged till then (after a fall)
 static s16 g_trace_hp = -1;
 
@@ -571,7 +773,7 @@ static void trace_actions(u32 sp, u32 mine) {
     u32 a = (u32)R16(mine + PL_ACT_ST) << 16 | R16(mine + PL_ACT_NO);
     s16 hp = (s16)R16(mine + PL_HP);
     if (a != g_act_me && (hp <= 0 || (a >> 16) >= 0x100 || (g_act_me >> 16) >= 0x100))
-        forge_log(LOG_INFO, "[npc-cart] you: act %04x:%04x -> %04x:%04x hp %d at %d %d %d zone %u", g_act_me >> 16,
+        forge_log(LOG_INFO, "[npc-cart] frame %u: you: act %04x:%04x -> %04x:%04x hp %d at %d %d %d zone %u", g_frames, g_act_me >> 16,
                   g_act_me & 0xffff, a >> 16, a & 0xffff, (int)hp, (int)RF(mine + PL_POS), (int)RF(mine + PL_POS + 4),
                   (int)RF(mine + PL_POS + 8), R8(mine + PL_AREA));
     g_act_me = a;
@@ -579,7 +781,7 @@ static void trace_actions(u32 sp, u32 mine) {
         u32 b = (u32)R16(g_npc + PL_ACT_ST) << 16 | R16(g_npc + PL_ACT_NO);
         s16 hn = (s16)R16(g_npc + PL_HP);
         if (b != g_act_npc && (hn <= 0 || (b >> 16) >= 0x100 || (g_act_npc >> 16) >= 0x100))
-            forge_log(LOG_INFO, "[npc-cart] helper: act %04x:%04x -> %04x:%04x hp %d at %d %d %d zone %u", g_act_npc >> 16,
+            forge_log(LOG_INFO, "[npc-cart] frame %u: helper: act %04x:%04x -> %04x:%04x hp %d at %d %d %d zone %u", g_frames, g_act_npc >> 16,
                       g_act_npc & 0xffff, b >> 16, b & 0xffff, (int)hn, (int)RF(g_npc + PL_POS), (int)RF(g_npc + PL_POS + 4),
                       (int)RF(g_npc + PL_POS + 8), R8(g_npc + PL_AREA));
         if (g_frames < g_trace_until && (b != g_act_npc || hn != g_trace_hp))
@@ -605,7 +807,7 @@ static void trace_actions(u32 sp, u32 mine) {
 
 void forge_onLoad(PluginInitParam *p) {
     p->required.major = 2, p->required.minor = 0, p->required.patch = 0;
-    const char *n = "NPC Hunter " NPC_VERSION;
+    const char *n = NPC_NAME;
     for (int i = 0; n[i] && i < 63; i++) p->name[i] = n[i];
 }
 
@@ -613,7 +815,7 @@ void forge_onUpdate(float dt) {
     (void)dt;
     if (!g_text) {
         g_text = forge_mem_getMainTextAddr();
-        forge_log(LOG_INFO, "[npc] NPC Hunter " NPC_VERSION " loaded (main at %08x). F4 helper on/off, F5 make it now, F6 log, F7 its moving on/off", g_text);
+        forge_log(LOG_INFO, "[npc] " NPC_NAME " loaded (main at %08x). F4 helper on/off, F5 make it now, F6 log, F7 its moving on/off", g_text);
     }
     g_frames++;
     static bool hooked;
@@ -624,6 +826,15 @@ void forge_onUpdate(float dt) {
         forge_hook_create((void *)(uintptr_t)A(FN_PL_PAD), (void *)pl_pad_hook, (void **)&g_pl_pad_orig);
         forge_hook_create((void *)(uintptr_t)A(FN_PL_INPUT), (void *)pl_input_hook, (void **)&g_pl_input_orig);
         forge_hook_create((void *)(uintptr_t)A(FN_PL_MOVE), (void *)pl_move_hook, (void **)&g_pl_move_orig);
+        forge_hook_create((void *)(uintptr_t)A(FN_EN_IGNORED), (void *)ignored_hook, (void **)&g_ignored_orig);
+        forge_log(LOG_INFO, "[npc] attention hook %s", g_ignored_orig ? "ok" : "FAILED");
+        forge_hook_create((void *)(uintptr_t)A(FN_FAINT), (void *)faint_hook, (void **)&g_faint_orig);
+        forge_hook_create((void *)(uintptr_t)A(FN_CART), (void *)cart_hook, (void **)&g_cart_orig);
+        forge_log(LOG_INFO, "[npc] cart hook %s", g_cart_orig ? "ok" : "FAILED");
+        forge_hook_create((void *)(uintptr_t)A(FN_CAM_EVENT), (void *)cam_hook, (void **)&g_cam_orig);
+        forge_hook_create((void *)(uintptr_t)A(FN_FALL_CAM), (void *)fall_cam_hook, (void **)&g_fall_cam_orig);
+        forge_log(LOG_INFO, "[npc] camera hooks %s %s", g_cam_orig ? "ok" : "FAILED", g_fall_cam_orig ? "ok" : "FAILED");
+        forge_log(LOG_INFO, "[npc] faint hook %s", g_faint_orig ? "ok" : "FAILED");
         forge_log(LOG_INFO, "[npc] pad hooks %s %s, move hook %s", g_pl_pad_orig ? "ok" : "FAILED", g_pl_input_orig ? "ok" : "FAILED",
                   g_pl_move_orig ? "ok" : "FAILED");
         forge_log(LOG_INFO, "[npc] hooks: depart %s, our hunter's making %s", g_depart_orig ? "ok" : "FAILED",
@@ -657,6 +868,9 @@ void forge_onUpdate(float dt) {
     }
     if (!g_seen_since) g_seen_since = g_frames;
     if (!g_quest_on) { g_quest_on = true; stats_reset(); }
+    if (g_placed && g_npc && g_npc_owner == mine && R32(sp + SP_SLOTS + 4 * (u32)g_npc_slot) == g_npc) unstick_fall(g_npc);
+    quest_watch();
+    if (g_placed && g_npc && g_npc_owner == mine && R32(sp + SP_SLOTS + 4 * (u32)g_npc_slot) == g_npc) cart_check(g_npc, mine);
     stats_frame(sp, mine);
     trace_actions(sp, mine);
     if (g_npc && g_npc_owner == mine && R32(sp + SP_SLOTS + 4 * (u32)g_npc_slot) == g_npc) let_monsters_see((u32)g_npc_slot);
