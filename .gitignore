@@ -1,0 +1,9 @@
+# build outputs
+*.o
+*.elf
+*.nro
+# reverse-engineering cache and game files (never commit the game's executables)
+*.pkl
+main
+*.nso
+log.txt
